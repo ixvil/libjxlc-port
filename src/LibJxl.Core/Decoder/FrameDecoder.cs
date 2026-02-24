@@ -71,6 +71,9 @@ public class FrameDecoder
     // Frame decoding state
     private PassesDecoderState _decState = new();
 
+    // Modular frame decoder (for lossless/modular streams)
+    private ModularFrameDecoder _modularDecoder = new();
+
     // Render pipeline
     private SimpleRenderPipeline? _pipeline;
     private byte[]? _outputPixels;
@@ -119,6 +122,9 @@ public class FrameDecoder
 
     /// <summary>Reference frames storage (up to 4 frames).</summary>
     public ReadOnlySpan<ReferenceFrame?> ReferenceFrames => _referenceFrames;
+
+    /// <summary>The modular frame decoder (for lossless decoding).</summary>
+    public ModularFrameDecoder ModularDecoder => _modularDecoder;
 
     /// <summary>
     /// Reads the frame header and TOC from the bitstream.
@@ -361,11 +367,18 @@ public class FrameDecoder
         _isFinalized = true;
 
         // Step 1: Finalize modular decoding
-        // In C++, this calls modular_frame_decoder_.FinalizeDecoding()
-        // which undoes global modular transforms and copies buffers.
-        // For now, this is a placeholder — modular transform undo
-        // will be implemented when the modular decoder is fully ported.
-        // TODO: modularFrameDecoder.FinalizeDecoding()
+        // Undoes global modular transforms (RCT, Squeeze, Palette) and
+        // converts int pixels to float for the render pipeline.
+        if (_modularDecoder.HasGlobalInfo)
+        {
+            _modularDecoder.FinalizeDecoding(_frameHeader);
+
+            // For modular-encoded frames, copy decoded data to pipeline
+            if (_frameHeader.Encoding == FrameEncoding.Modular && _pipeline?.ChannelData != null)
+            {
+                _modularDecoder.CopyToFloat(_frameHeader, _pipeline.ChannelData);
+            }
+        }
 
         // Step 2: Execute the render pipeline
         // SimpleRenderPipeline processes the full image in one call.
@@ -467,7 +480,11 @@ public class FrameDecoder
                 return false;
         }
 
-        // TODO: Decode modular global info (tree, ANS codes, global channels)
+        // Decode modular global info (tree, ANS codes, global channels)
+        // This is called for both VarDCT and Modular modes — VarDCT uses
+        // modular streams for DC, AC metadata, and extra channels.
+        var modularStatus = _modularDecoder.DecodeGlobalInfo(br, _frameHeader);
+        if (!modularStatus) return false;
 
         _decodedDcGlobal = true;
         return true;
@@ -492,7 +509,14 @@ public class FrameDecoder
             // via modular streams
         }
 
-        // TODO: Decode modular group data for DC group rectangle
+        // Decode modular group data for this DC group rectangle
+        if (_frameHeader.Encoding == FrameEncoding.Modular)
+        {
+            var modGroupStatus = _modularDecoder.DecodeGroup(
+                br, _frameHeader, dcGroupId, 3, int.MaxValue,
+                ModularStreamId.ModularDC(dcGroupId));
+            if (!modGroupStatus) return false;
+        }
 
         _decodedDcGroups[dcGroupId] = true;
         return true;
@@ -537,8 +561,44 @@ public class FrameDecoder
             // Add the final write stage
             _pipeline.AddStage(new StageWrite(_outputPixels, width, numChannels, hasAlpha));
 
-            // TODO: AdaptiveDCSmoothing()
-            // Gaussian-weighted smoothing across 3×3 DC blocks at boundaries
+            // Adaptive DC Smoothing — reduces banding in smooth DC areas
+            bool skipSmoothing =
+                (_frameHeader.Flags & FrameHeader.FlagSkipAdaptiveDCSmoothing) != 0 ||
+                (_frameHeader.Flags & FrameHeader.FlagUseDcFrame) != 0 ||
+                !_frameHeader.ChromaSubsampling.Is444;
+
+            if (!skipSmoothing && _decState.Shared.DcStorage != null)
+            {
+                var dcFactors = new float[]
+                {
+                    _decState.Shared.Matrices.DCQuant(0),
+                    _decState.Shared.Matrices.DCQuant(1),
+                    _decState.Shared.Matrices.DCQuant(2),
+                };
+
+                // Convert DcStorage [c,y,x] → float[][][] for smoothing
+                int dcH = _decState.Shared.DcStorage.GetLength(1);
+                int dcW = _decState.Shared.DcStorage.GetLength(2);
+                var dc = new float[3][][];
+                for (int c = 0; c < 3; c++)
+                {
+                    dc[c] = new float[dcH][];
+                    for (int y = 0; y < dcH; y++)
+                    {
+                        dc[c][y] = new float[dcW];
+                        for (int x = 0; x < dcW; x++)
+                            dc[c][y][x] = _decState.Shared.DcStorage[c, y, x];
+                    }
+                }
+
+                AdaptiveDCSmoothing.Smooth(dc, dcFactors);
+
+                // Write back
+                for (int c = 0; c < 3; c++)
+                    for (int y = 0; y < dcH; y++)
+                        for (int x = 0; x < dcW; x++)
+                            _decState.Shared.DcStorage[c, y, x] = dc[c][y][x];
+            }
         }
         else
         {

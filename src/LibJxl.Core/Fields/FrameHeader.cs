@@ -25,6 +25,17 @@ public class YCbCrChromaSubsampling
         return true;
     }
 
+    /// <summary>Whether channel c is horizontally subsampled relative to max.</summary>
+    public bool IsHSubsampled(int c) =>
+        c < 3 && HShift[ChannelMode[c]] < MaxHShift;
+
+    /// <summary>Whether channel c is vertically subsampled relative to max.</summary>
+    public bool IsVSubsampled(int c) =>
+        c < 3 && VShift[ChannelMode[c]] < MaxVShift;
+
+    /// <summary>Whether any chroma subsampling is used.</summary>
+    public bool Is444 => MaxHShift == 0 && MaxVShift == 0;
+
     private void Recompute()
     {
         MaxHShift = 0;

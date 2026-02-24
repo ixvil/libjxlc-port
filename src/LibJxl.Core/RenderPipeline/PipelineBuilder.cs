@@ -25,6 +25,21 @@ public static class PipelineBuilder
         var pipeline = new SimpleRenderPipeline();
         pipeline.AllocateBuffers(width, height, numChannels);
 
+        // 0. Chroma upsampling (if subsampled, e.g., 4:2:0, 4:2:2, 4:4:0)
+        if (!fh.ChromaSubsampling.Is444)
+        {
+            for (int c = 0; c < Math.Min(numChannels, 3); c++)
+            {
+                // Horizontal upsampling for channels that are horizontally subsampled
+                if (fh.ChromaSubsampling.IsHSubsampled(c))
+                    pipeline.AddStage(new StageChromaUpsamplingH(c));
+
+                // Vertical upsampling for channels that are vertically subsampled
+                if (fh.ChromaSubsampling.IsVSubsampled(c))
+                    pipeline.AddStage(new StageChromaUpsamplingV(c));
+            }
+        }
+
         // 1. Gaborish (if enabled)
         if (fh.Filter.Gab)
         {
