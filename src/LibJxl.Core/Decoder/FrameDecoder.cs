@@ -1,7 +1,10 @@
 // Port of lib/jxl/dec_frame.h/cc — Frame decoder orchestrator
 using LibJxl.Base;
 using LibJxl.Bitstream;
+using LibJxl.ColorManagement;
+using LibJxl.Entropy;
 using LibJxl.Fields;
+using LibJxl.RenderPipeline;
 
 namespace LibJxl.Decoder;
 
@@ -20,6 +23,28 @@ public struct SectionInfo
     public BitReader Reader;
     public int Id;     // Logical section ID
     public int Index;  // Physical index in the bytestream
+}
+
+/// <summary>
+/// Stored reference frame data.
+/// Port of jxl::FrameDecoder reference_frames.
+/// </summary>
+public class ReferenceFrame
+{
+    /// <summary>Pixel data for this reference frame (float per channel per row).</summary>
+    public float[][][]? ChannelData; // [channel][row][col]
+
+    /// <summary>Width of the reference frame.</summary>
+    public int Width;
+
+    /// <summary>Height of the reference frame.</summary>
+    public int Height;
+
+    /// <summary>Whether saved before color transform (for proper reconstruction).</summary>
+    public bool SavedBeforeColorTransform;
+
+    /// <summary>The frame header of the source frame.</summary>
+    public FrameHeader? SourceHeader;
 }
 
 /// <summary>
@@ -42,6 +67,16 @@ public class FrameDecoder
     private bool _finalizedDc = true;
     private bool _isFinalized = true;
     private int _numSectionsDone;
+
+    // Frame decoding state
+    private PassesDecoderState _decState = new();
+
+    // Render pipeline
+    private SimpleRenderPipeline? _pipeline;
+    private byte[]? _outputPixels;
+
+    // Reference frames (up to 4, indexed by save_as_reference)
+    private readonly ReferenceFrame?[] _referenceFrames = new ReferenceFrame?[4];
 
     public FrameDecoder(ImageMetadata metadata, SizeHeader sizeHeader)
     {
@@ -69,6 +104,21 @@ public class FrameDecoder
 
     /// <summary>Whether all sections have been processed.</summary>
     public bool HasDecodedAll => _numSectionsDone == _toc.Length;
+
+    /// <summary>The decoder state containing shared/per-frame data.</summary>
+    public PassesDecoderState DecState => _decState;
+
+    /// <summary>The render pipeline (available after DC finalization).</summary>
+    public SimpleRenderPipeline? Pipeline => _pipeline;
+
+    /// <summary>
+    /// Output pixel buffer (available after FinalizeFrame).
+    /// Layout: RGB or RGBA, row-major, 8-bit per channel.
+    /// </summary>
+    public byte[]? OutputPixels => _outputPixels;
+
+    /// <summary>Reference frames storage (up to 4 frames).</summary>
+    public ReadOnlySpan<ReferenceFrame?> ReferenceFrames => _referenceFrames;
 
     /// <summary>
     /// Reads the frame header and TOC from the bitstream.
@@ -124,6 +174,10 @@ public class FrameDecoder
         _decodedDcGroups = new bool[_frameDim.NumDcGroups];
         _decodedPassesPerAcGroup = new byte[_frameDim.NumGroups];
         _processedSection = new bool[_toc.Length];
+
+        // Initialize decoder state
+        _decState = new PassesDecoderState();
+        _decState.Init(_frameHeader);
 
         return true;
     }
@@ -290,10 +344,70 @@ public class FrameDecoder
         return true;
     }
 
-    /// <summary>Runs final operations once all frame data is decoded.</summary>
+    /// <summary>
+    /// Runs final operations once all frame data is decoded.
+    /// Executes the render pipeline to produce output pixels.
+    /// Port of FrameDecoder::FinalizeFrame.
+    ///
+    /// Steps:
+    /// 1. Finalize modular decoding (undo global transforms).
+    /// 2. Execute the render pipeline (all stages: filter → upsample → color → write).
+    /// 3. Store reference frame if CanBeReferenced().
+    /// </summary>
     public JxlStatus FinalizeFrame()
     {
+        if (_isFinalized) return false; // Already finalized
+
         _isFinalized = true;
+
+        // Step 1: Finalize modular decoding
+        // In C++, this calls modular_frame_decoder_.FinalizeDecoding()
+        // which undoes global modular transforms and copies buffers.
+        // For now, this is a placeholder — modular transform undo
+        // will be implemented when the modular decoder is fully ported.
+        // TODO: modularFrameDecoder.FinalizeDecoding()
+
+        // Step 2: Execute the render pipeline
+        // SimpleRenderPipeline processes the full image in one call.
+        // A proper grouped pipeline would iterate per group, but
+        // the simple pipeline processes all stages across the entire buffer.
+        if (_pipeline != null)
+        {
+            if (!_pipeline.ProcessGroup(0, 0))
+                return false;
+        }
+
+        // Step 3: Store reference frame if needed
+        if (_frameHeader.CanBeReferenced() && _pipeline?.ChannelData != null)
+        {
+            int slot = (int)_frameHeader.SaveAsReference;
+            if (slot < _referenceFrames.Length)
+            {
+                var refFrame = new ReferenceFrame
+                {
+                    Width = _frameDim.XSize,
+                    Height = _frameDim.YSize,
+                    SavedBeforeColorTransform = _frameHeader.SaveBeforeColorTransform,
+                    SourceHeader = _frameHeader,
+                };
+
+                // Deep-copy the channel data so future frames can reference it
+                var src = _pipeline.ChannelData;
+                refFrame.ChannelData = new float[src.Length][][];
+                for (int c = 0; c < src.Length; c++)
+                {
+                    refFrame.ChannelData[c] = new float[src[c].Length][];
+                    for (int y = 0; y < src[c].Length; y++)
+                    {
+                        refFrame.ChannelData[c][y] = new float[src[c][y].Length];
+                        Array.Copy(src[c][y], refFrame.ChannelData[c][y], src[c][y].Length);
+                    }
+                }
+
+                _referenceFrames[slot] = refFrame;
+            }
+        }
+
         return true;
     }
 
@@ -310,38 +424,209 @@ public class FrameDecoder
 
     // === Private section processors ===
 
+    /// <summary>
+    /// Phase 1: DC Global — patches, splines, noise, quantizer, color correlation, modular global.
+    /// Port of FrameDecoder::ProcessDCGlobal.
+    /// </summary>
     private JxlStatus ProcessDCGlobal(BitReader br)
     {
-        // In full implementation: decode patches, splines, noise, quantizer, block ctx map, modular global
-        // For now: mark as done (stub for modular-only decoding)
+        var shared = _decState.Shared;
+        var features = shared.ImageFeatures;
+
+        if (_frameHeader.Encoding == FrameEncoding.VarDCT)
+        {
+            // Decode image features
+            if ((_frameHeader.Flags & FrameHeader.FlagPatches) != 0)
+            {
+                if (!features.Patches.Decode(br, _frameDim.XSize, _frameDim.YSize, 0))
+                    return false;
+            }
+
+            if ((_frameHeader.Flags & FrameHeader.FlagSplines) != 0)
+            {
+                if (!features.Splines.Decode(br, (long)_frameDim.XSize * _frameDim.YSize))
+                    return false;
+            }
+
+            if ((_frameHeader.Flags & FrameHeader.FlagNoise) != 0)
+            {
+                if (!features.Noise.Decode(br))
+                    return false;
+            }
+
+            // Decode DC dequantization (DC quant matrices)
+            if (!shared.Matrices.DecodeDC(br))
+                return false;
+
+            // Decode quantizer (global_scale + quant_dc)
+            if (!shared.Quantizer.ReadFromBitStream(br))
+                return false;
+
+            // Decode color correlation map (chroma from luma DC parameters)
+            if (!shared.Cmap.DecodeDC(br))
+                return false;
+        }
+
+        // TODO: Decode modular global info (tree, ANS codes, global channels)
+
         _decodedDcGlobal = true;
         return true;
     }
 
+    /// <summary>
+    /// Phase 2: DC Group — VarDCT DC coefficients, AC metadata per group.
+    /// Port of FrameDecoder::ProcessDCGroup.
+    /// </summary>
     private JxlStatus ProcessDCGroup(int dcGroupId, BitReader br)
     {
-        // In full implementation: decode VarDCT DC, modular DC, AC metadata
+        var shared = _decState.Shared;
+
+        if (_frameHeader.Encoding == FrameEncoding.VarDCT)
+        {
+            // TODO: Decode VarDCT DC coefficients for this group via modular decoder
+            // - Extra precision bits
+            // - Create 3-channel image for YCbCr DC
+            // - Dequantize DC
+
+            // TODO: Decode AC metadata (strategy, quant field, EPF sharpness)
+            // via modular streams
+        }
+
+        // TODO: Decode modular group data for DC group rectangle
+
         _decodedDcGroups[dcGroupId] = true;
         return true;
     }
 
+    /// <summary>
+    /// Phase 3: Finalize DC — build pipeline, adaptive DC smoothing.
+    /// Port of FrameDecoder::FinalizeDC + PreparePipeline.
+    /// </summary>
     private JxlStatus FinalizeDC()
     {
-        // In full implementation: adaptive DC smoothing
+        int width = _frameDim.XSize;
+        int height = _frameDim.YSize;
+
+        // Detect alpha channel from metadata
+        bool hasAlpha = false;
+        if (_frameHeader.NonserializedMetadata != null)
+        {
+            foreach (var ec in _frameHeader.NonserializedMetadata.ExtraChannelInfos)
+            {
+                if (ec.Type == ExtraChannelType.Alpha)
+                {
+                    hasAlpha = true;
+                    break;
+                }
+            }
+        }
+
+        int numChannels = hasAlpha ? 4 : 3;
+
+        // Build the render pipeline
+        if (_frameHeader.Encoding == FrameEncoding.VarDCT)
+        {
+            // Build pipeline using PipelineBuilder (adds Gaborish, EPF, Upsampling, XYB/YCbCr, FromLinear)
+            _pipeline = PipelineBuilder.BuildVarDctPipeline(
+                _frameHeader, _frameDim, numChannels, width, height);
+
+            // Allocate output pixel buffer
+            int stride = hasAlpha ? 4 : 3;
+            _outputPixels = new byte[width * height * stride];
+
+            // Add the final write stage
+            _pipeline.AddStage(new StageWrite(_outputPixels, width, numChannels, hasAlpha));
+
+            // TODO: AdaptiveDCSmoothing()
+            // Gaussian-weighted smoothing across 3×3 DC blocks at boundaries
+        }
+        else
+        {
+            // Modular mode: simpler pipeline (just output writing)
+            _pipeline = new SimpleRenderPipeline();
+            _pipeline.AllocateBuffers(width, height, numChannels);
+
+            int stride = hasAlpha ? 4 : 3;
+            _outputPixels = new byte[width * height * stride];
+            _pipeline.AddStage(new StageWrite(_outputPixels, width, numChannels, hasAlpha));
+        }
+
         _finalizedDc = true;
         return true;
     }
 
+    /// <summary>
+    /// Phase 4: AC Global — dequant matrices, coefficient orders, ANS histograms.
+    /// Port of FrameDecoder::ProcessACGlobal.
+    /// </summary>
     private JxlStatus ProcessACGlobal(BitReader br)
     {
-        // In full implementation: decode quant matrices, coefficient orders, ANS histograms
+        var shared = _decState.Shared;
+
+        if (_frameHeader.Encoding == FrameEncoding.VarDCT)
+        {
+            // Decode full dequantization matrices
+            if (!shared.Matrices.Decode(br))
+                return false;
+
+            // Number of histogram sets
+            int numHistoBits = CeilLog2(shared.FrameDim.NumGroups);
+            shared.NumHistograms = 1;
+            if (numHistoBits > 0)
+                shared.NumHistograms = 1 + (int)br.ReadBits(numHistoBits);
+
+            int numPasses = (int)_frameHeader.PassesInfo.NumPasses;
+            shared.CoeffOrders = new int[numPasses][];
+
+            // Decode coefficient orders + histograms per pass
+            for (int pass = 0; pass < numPasses; pass++)
+            {
+                // Determine which orders are used
+                ushort usedOrders = (ushort)br.ReadBits(AcStrategy.kNumOrders);
+
+                // Decode coefficient orders
+                shared.CoeffOrders[pass] = CoeffOrder.DecodeCoeffOrders(usedOrders, br);
+
+                // Decode ANS histograms for this pass
+                int numContexts = shared.BlockCtxMap.NumACContexts() * shared.NumHistograms;
+                _decState.Codes![pass] = new ANSCode();
+                var histStatus = HistogramDecoder.DecodeHistograms(
+                    br, numContexts, _decState.Codes[pass], out _decState.ContextMaps![pass]);
+                if (!histStatus) return false;
+            }
+
+            // Compute dequant tables for used AC strategies
+            if (!shared.Matrices.EnsureComputed(_decState.UsedAcs))
+                return false;
+        }
+
         _decodedAcGlobal = true;
         return true;
     }
 
+    /// <summary>
+    /// Phase 5: AC Group — decode AC coefficients, dequantize, IDCT, render pipeline.
+    /// Port of FrameDecoder::ProcessACGroup.
+    /// </summary>
     private JxlStatus ProcessACGroup(int acGroupId, BitReader[] passReaders, int numPasses)
     {
-        // In full implementation: decode AC coefficients, dequantize, IDCT, render pipeline
+        if (_frameHeader.Encoding == FrameEncoding.VarDCT)
+        {
+            for (int p = 0; p < numPasses; p++)
+            {
+                int passIdx = _decodedPassesPerAcGroup[acGroupId] + p;
+                if (passReaders[p] == null) continue;
+
+                if (!DecGroup.DecodeGroupPass(_frameHeader, _decState, acGroupId, passIdx, passReaders[p]))
+                    return false;
+            }
+        }
+        else
+        {
+            // Modular AC: decode modular group for each pass
+            // TODO: modular_frame_decoder.DecodeGroup()
+        }
+
         _decodedPassesPerAcGroup[acGroupId] += (byte)numPasses;
         return true;
     }
@@ -353,5 +638,11 @@ public class FrameDecoder
             if (!_decodedDcGroups[i]) return true;
         }
         return false;
+    }
+
+    private static int CeilLog2(int n)
+    {
+        if (n <= 1) return 0;
+        return 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)(n - 1));
     }
 }

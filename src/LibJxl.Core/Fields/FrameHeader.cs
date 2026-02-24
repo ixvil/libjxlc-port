@@ -354,6 +354,18 @@ public class FrameHeader
     public int GroupDimPixels => (FrameConstants.GroupDim >> 1) << (int)GroupSizeShift;
 
     /// <summary>
+    /// Whether this frame can be stored as a reference frame.
+    /// Port of FrameHeader::CanBeReferenced.
+    /// </summary>
+    public bool CanBeReferenced()
+    {
+        return Type != FrameType.SkipProgressive &&
+               (SaveAsReference != 0 ||
+                Type == FrameType.RegularFrame ||
+                Type == FrameType.ReferenceOnly);
+    }
+
+    /// <summary>
     /// Computes the full FrameDimensions from this header and the image metadata.
     /// </summary>
     public FrameDimensions ToFrameDimensions()

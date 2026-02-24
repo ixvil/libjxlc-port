@@ -49,16 +49,52 @@ public abstract class RenderPipelineStage
     public abstract ChannelMode GetChannelMode(int channel);
 
     /// <summary>
-    /// Process a single row of data.
-    /// inputRows[channel][rowOffset] and outputRows[channel][rowOffset] are row spans.
+    /// Process a single row of data (simple interface without border).
+    /// inputRows[channel] and outputRows[channel] are the center row.
     /// </summary>
     public abstract bool ProcessRow(
         float[][] inputRows, float[][] outputRows,
         int xsize, int xpos, int ypos, int threadId);
+
+    /// <summary>
+    /// Process a row with multi-row border access.
+    /// inputRows[channel][rowIndex] provides rows y-borderY..y+borderY.
+    /// outputRows[channel][oy] provides output rows (1 &lt;&lt; shiftY for InOut).
+    /// Default: extracts center row and delegates to ProcessRow.
+    /// Override for stages needing neighbor rows (Gaborish, EPF, etc).
+    /// </summary>
+    public virtual bool ProcessRowWithBorder(
+        float[][][] inputRows, float[][][] outputRows,
+        int xsize, int xpos, int ypos, int threadId)
+    {
+        int borderY = Settings.BorderY;
+        int nc = inputRows.Length;
+        var centerIn = new float[nc][];
+        var centerOut = new float[nc][];
+        for (int c = 0; c < nc; c++)
+        {
+            centerIn[c] = inputRows[c] != null && inputRows[c].Length > borderY
+                ? inputRows[c][borderY]
+                : (inputRows[c] != null && inputRows[c].Length > 0 ? inputRows[c][0] : null!);
+            centerOut[c] = outputRows[c] != null && outputRows[c].Length > 0
+                ? outputRows[c][0]
+                : centerIn[c];
+        }
+        return ProcessRow(centerIn, centerOut, xsize, xpos, ypos, threadId);
+    }
 
     /// <summary>Inform the stage about input sizes.</summary>
     public virtual bool SetInputSizes(List<(int w, int h)> sizes) => true;
 
     /// <summary>Prepare per-thread storage.</summary>
     public virtual bool PrepareForThreads(int numThreads) => true;
+
+    /// <summary>Mirror index for border extension.</summary>
+    protected static int Mirror(int idx, int size)
+    {
+        if (size <= 1) return 0;
+        while (idx < 0) idx += 2 * size;
+        idx %= (2 * size);
+        return idx < size ? idx : 2 * size - 1 - idx;
+    }
 }
